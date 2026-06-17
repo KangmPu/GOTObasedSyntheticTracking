@@ -91,6 +91,7 @@ python detect_mover_gif.py <input.gif>     --vmax 50 (length pred from speed, un
 ```
 Output: if detection, an annotated gif and a stacked image; if not only a stacked image.
 
+if cuda environment avalibale. Can replace this script by detect_mover_gif_gpuver.py with same name. 
 ---
 
 ### 3. `autochecker_MPClist_pipeline.py`
