@@ -173,34 +173,6 @@ Both `run_client_batch.py` and `run_client_fits_cutouts_batch.py` expect these u
 Network access for Warwick-side utilities relies on SSH key authentication:
 
 - Ensure you have an SSH key (e.g., `~/.ssh/id_rsa`) and that the public key is added to the Warwick account authorized keys.
-- Configure `~/.ssh/config` with host, user, and port information, for example:
-  ```
-    Host warwick-gw
-        HostName goto-observatory.warwick.ac.uk
-        User <username>
-        IdentityFile <ssh key path>
-        IdentitiesOnly yes
-    
-    # Used by AP_workflow / FitsCutoutClient when server="warwick"
-    Host gotohead
-        HostName gotocompute4
-        User <username>
-        IdentityFile <ssh key path>
-        IdentitiesOnly yes
-        ProxyCommand ssh -W gotocompute4:22 warwick-gw
-        StrictHostKeyChecking accept-new
-    
-    # Optional: for interactive login: `ssh gotocompute4`
-    # (Same settings as gotohead so you can use either name)
-    Host gotocompute4
-        HostName gotocompute4
-        User <username>
-        IdentityFile <ssh key path>
-        IdentitiesOnly yes
-        ProxyCommand ssh -W gotocompute4:22 warwick-gw
-        StrictHostKeyChecking accept-new
-
-  ```
 - The client scripts (`run_client_batch.py`, `run_client_fits_cutouts_batch.py`) use this host alias; test with `ssh warwick "hostname"` before running the workflows.
 
 Database credentials are read from `~/.pgpass`.
