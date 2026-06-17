@@ -1,0 +1,1474 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+os.environ['PGPASSFILE'] = os.path.expanduser('~/.pgpass')
+from pathlib import Path
+
+import re
+import io
+import ast
+import time
+import argparse
+import warnings
+import contextlib
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+# ---------- DB usage (correct) ----------
+import gotodb as gdb
+
+def goto_silent():
+    """Silent wrapper for gdb.goto() to suppress startup prints."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        return gdb.goto()
+
+def query_df(db, sql, params=None):
+    """Thin wrapper to align with your usage."""
+    return db.query(sql, params or {})
+
+# ---------- Selenium to scrape MPC Customize object list ----------
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+
+# ---------- Astronomy ----------
+from astroquery.mpc import MPC
+import astropy.units as u
+from astropy.coordinates import SkyCoord
+
+# ---------- Interp / modeling ----------
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ExpSineSquared, RationalQuadratic
+from sklearn.exceptions import ConvergenceWarning
+from scipy.fft import rfft, rfftfreq
+from scipy.signal import detrend
+
+# ---------- Geometry ----------
+from shapely.geometry import Polygon, Point
+from shapely.prepared import prep
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore")
+
+# ========================= Config =========================
+
+# Map t-prefix to site name
+SITE_MAP = {"t1": "La Palma", "t2": "La Palma", "t3": "Siding Spring", "t4": "Siding Spring"}
+
+# ========================= Utilities =========================
+
+def _tprefix(filepath: str):
+    """Extract tN (t1..t4) from filepath."""
+    if not isinstance(filepath, str):
+        return None
+    mobj = re.search(r"/(t[1-4])[_\.]", filepath.lower())
+    return mobj.group(1) if mobj else None
+
+def safe_parse_footprint(v):
+    """Parse polygon from text/list; return shapely Polygon or None."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    try:
+        pts = ast.literal_eval(v) if isinstance(v, str) else v
+        if pts is None or len(pts) < 3:
+            return None
+        poly = Polygon(pts)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        return poly
+    except Exception:
+        return None
+
+def debug_null_report_ephem_obs(comb: pd.DataFrame, rec: pd.DataFrame):
+    print("\n=== [CHECK] Ephemerides (combined_df) ===")
+    print(f"rows_total: {len(comb)}")
+    comb = comb.copy()
+    comb['datetime_utc'] = pd.to_datetime(comb['datetime'], utc=True, errors='coerce')
+    comb['site_stripped'] = comb.get('site', "").astype(str).str.strip()
+    ra_num  = pd.to_numeric(comb.get('ra', comb.get('RA', np.nan)), errors='coerce')
+    dec_num = pd.to_numeric(comb.get('dec', comb.get('DEC', np.nan)), errors='coerce')
+    print("null_counts:", {
+        'datetime': int(comb['datetime_utc'].isna().sum()),
+        'site'    : int(pd.Series(comb['site_stripped']).eq("").sum()),
+        'ra'      : int(ra_num.isna().sum()),
+        'dec'     : int(dec_num.isna().sum()),
+    })
+    print("site_distribution:", comb.get('site', pd.Series([], dtype=str)).value_counts(dropna=False).to_dict())
+
+    print("\n=== [CHECK] Observations (recent_obs_df) ===")
+    print(f"rows_total: {len(rec)}")
+    rec = rec.copy()
+    rec['obs_date_utc'] = pd.to_datetime(rec['obs_date'], utc=True, errors='coerce')
+    polys = []
+    for v in tqdm(rec['astrom_footprint'].tolist(), desc="Parse footprints", unit="fp", leave=False):
+        polys.append(safe_parse_footprint(v))
+    rec['poly_obj'] = polys
+    print("null_counts:", {
+        "obs_date"      : int(rec['obs_date_utc'].isna().sum()),
+        "footprint_null": int(rec['astrom_footprint'].isna().sum()),
+        "polygon_failed": int(pd.Series(rec['poly_obj']).isna().sum()),
+        "site_unknown"  : int(rec['site'].astype(str).str.strip().eq('UNKNOWN').sum()),
+    })
+    print("site_distribution:", rec.get('site', pd.Series([], dtype=str)).value_counts(dropna=False).to_dict())
+
+def ensure_list_length(seq, L, fill=np.nan):
+    """
+    Make a 1-D Python list of length L:
+    - None or empty -> [fill]*L
+    - len(seq) > L  -> seq[:L]
+    - len(seq) < L  -> pad with fill
+    Accepts list/tuple/np.ndarray/pd.Series/scalar.
+    """
+    if seq is None:
+        return [fill] * L
+    if isinstance(seq, (pd.Series, np.ndarray)):
+        seq = seq.tolist()
+    elif not isinstance(seq, (list, tuple)):
+        # scalar
+        seq = [seq]
+    n = len(seq)
+    if n >= L:
+        return list(seq[:L])
+    return list(seq) + [fill] * (L - n)
+
+def minute_floor_utc(x):
+    """Robust minute bucket: tz-aware / strings both OK."""
+    return pd.to_datetime(x, utc=True, errors='coerce').dt.floor('T')
+
+# ========================= Observations from image.single =========================
+
+def load_observations_from_image_single(lookback_days=30, only_has_footprint=True):
+    """
+    Pull observations from image.single.
+    Window ends at overall max(date_mid) (no footprint filtering), then goes back lookback_days.
+
+    Returns columns:
+      site (from DB), obs_date (DB raw), astrom_footprint, telescope, filepath, obs_date_utc (UTC shadow)
+    """
+    db = goto_silent()
+
+    # rowcnt = query_df(db, 'SELECT count(*) AS n FROM "image"."single"')
+    # rng    = query_df(db, 'SELECT min(date_mid) AS min_dt, max(date_mid) AS max_dt FROM "image"."single"')
+    # if int(rowcnt.loc[0, "n"]) == 0 or pd.isna(rng.loc[0, "max_dt"]):
+    #     print("[OBS] image.single empty.")
+    #     return pd.DataFrame(columns=["site","obs_date","astrom_footprint","telescope","filepath","obs_date_utc"])
+
+    # tmax = pd.to_datetime(rng.loc[0, "max_dt"])
+    tmax = pd.Timestamp.utcnow()
+    tmin = tmax - timedelta(days=lookback_days)
+    print(f"[OBS] Fetch window (no footprint filtering): {tmin} -> {tmax}")
+
+    
+
+    
+    sql_recent = """
+                SELECT
+                  s.id                             AS id,
+                  r.site                           AS site,          
+                  s.date_mid                       AS obs_date,
+                  CAST(s.astrom_footprint AS TEXT) AS astrom_footprint,
+                  s.filepath                       AS filepath,
+                  s.image_type                     AS image_type,
+                  s.astrom_n_match,
+                  s.astrom_uncert_med,
+                  s.astrom_ra_centre,
+                  s.astrom_dec_centre,
+                  s.astrom_pixel_scale
+                FROM "image"."single" AS s
+                LEFT JOIN "raw"."science" AS r
+                  ON r.id = s.raw_id
+                WHERE s.date_mid BETWEEN %(tmin)s AND %(tmax)s
+                ORDER BY s.date_mid ASC;
+                    """
+    df = query_df(db, sql_recent, {"tmin": tmin, "tmax": tmax})
+    print(f"loaded rows (has footprint, {lookback_days}d): {len(df)}")
+    print(query_df(db, "SELECT current_database() AS db, current_schema() AS schema"))
+    print(query_df(db, "SHOW search_path"))
+    print(query_df(db, "SELECT to_regclass('\"image\".\"single\"') AS rel"))
+
+    if "filepath" in df.columns:
+        df["telescope"] = df["filepath"].map(_tprefix)
+    else:
+        df["telescope"] = None
+
+    df["site"] = df["site"].astype(str).str.strip()
+
+    df["obs_date_utc"] = pd.to_datetime(df["obs_date"], utc=True, errors="coerce")
+
+    if not df.empty:
+        print("[OBS] Per-site counts in window:")
+        print(df.groupby("site").size().rename("rows").sort_index())
+
+    return df
+
+# ========================= MPC object names (Customize page) =========================
+
+def scrape_object_names(limit_mag="19.5"):
+    """Scrape object names from MPC Customize page."""
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+
+    driver.get("https://minorplanetcenter.net/iau/lists/Customize.html")
+
+    # magnitude
+    object_input = driver.find_element(By.NAME, "mag2")
+    object_input.clear()
+    object_input.send_keys(limit_mag)
+
+    # single-opposition only
+    checkboxes = driver.find_elements(By.NAME, "to")
+    for checkbox in checkboxes:
+        value = checkbox.get_attribute("value")
+        if value == "1":
+            if not checkbox.is_selected():
+                checkbox.click()
+        else:
+            if checkbox.is_selected():
+                checkbox.click()
+
+    # submit
+    submit_button = driver.find_element(
+        By.XPATH,
+        '//input[@type="submit" and @value=" Customize page "]'
+    )
+    submit_button.click()
+    time.sleep(2)
+
+    html = driver.page_source
+    driver.quit()
+
+    pattern = re.compile(
+        r'<input\s+type="checkbox"\s+name="Obj"\s+value="(K\d{2}[A-Z0-9]{4,})">\s+(\d{4}\s+[A-Z]+\d*[A-Z]*)'
+    )
+    results = [{'Obj_Value': m.group(1), 'Obj_Name': m.group(2)} for m in pattern.finditer(html)]
+    df = pd.DataFrame(results)
+
+    if df.empty:
+        print("[WARN] MPC Customize scrape returned empty list.")
+
+    # Append custom targets (assumes MY_TARGETS is defined elsewhere)
+    if "MY_TARGETS" in globals() and MY_TARGETS:
+        extra = pd.DataFrame({"Obj_Value": MY_TARGETS, "Obj_Name": MY_TARGETS})
+        try:
+            df = pd.concat([df, extra], ignore_index=True)
+            print(f"Customized target(s) {MY_TARGETS} added.")
+        except Exception as e:
+            print(f"[WARN] Failed to append custom targets {MY_TARGETS}: {e}")
+
+    # ---- Filter: drop non-2025 provisional designations like '2024 TK2' ----
+    # Only touch rows that look like 'YYYY XXX...' and are not 2025.
+    non_2025_mask = df["Obj_Name"].str.match(r"^(?!2025)\d{4}\s", na=False)
+    if non_2025_mask.any():
+        dropped = df.loc[non_2025_mask, "Obj_Name"].tolist()
+        print(f"[INFO] Dropping non-2025 objects: {', '.join(dropped)}")
+        df = df[~non_2025_mask].reset_index(drop=True)
+    print(df)
+
+    return df
+
+# ========================= Ephemerides (ONLY ra_rate / dec_rate) =========================
+
+def _parse_rate_as_asmin(x):
+    """Parse any rate value (possibly with units) into arcsec/min float."""
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x, (int, float, np.number)):
+        return float(x)
+    s = str(x).strip().lower()
+    m = re.search(r'[-+]?\d+(\.\d+)?([eE][-+]?\d+)?', s)
+    if not m:
+        return np.nan
+    val = float(m.group(0))
+    # unit normalization: default arcsec/min
+    if ('hour' in s) or ('/hr' in s) or ('/h' in s):
+        val = val / 60.0
+    elif ('/day' in s) or ('/d' in s):
+        val = val / 1440.0
+    elif ('/s' in s) or ('/sec' in s) or ('/second' in s):
+        val = val * 60.0
+    return val
+
+def fetch_ephemeris(target_name: str, start_date: str, interval_min: int, step_count: int,
+                    site_lon: float, site_lat: float, site_height: float) -> pd.DataFrame:
+    """
+    Use astroquery.MPC get_ephemeris and return DataFrame with ra_rate/dec_rate normalized (arcsec/min).
+    NO P.A. fields are computed.
+    """
+    step = f"{interval_min} minute"
+    loc  = (site_lon*u.deg, site_lat*u.deg, site_height*u.m)
+    table = MPC.get_ephemeris(
+        target_name,
+        start=start_date,
+        step=step,
+        number=step_count,
+        location=loc,
+        eph_type='equatorial',
+        proper_motion='coordinate',
+        suppress_daytime=False
+    )
+
+    df = table.to_pandas()
+
+    # rename common columns if present
+    rename_map = {
+        'Date'        : 'Date',
+        'RA'          : 'RA',
+        'Dec'         : 'DEC',
+        'Delta'       : 'Delta (AU)',
+        'r'           : 'r (AU)',
+        'elong'       : 'Elongation',
+        'phase'       : 'Phase',
+        'V'           : 'Vmag',
+        'Altitude'    : 'Alt',
+        'Sun altitude': 'Sun_Alt',
+        'dRA'         : 'RA_rate',
+        'dDec'        : 'Dec_rate',
+        'Uncertainty 3sig' : 'unc',
+    }
+    for k, v in list(rename_map.items()):
+        if k not in df.columns:
+            del rename_map[k]
+    df = df.rename(columns=rename_map)
+
+    # object tag
+    df['Object'] = target_name
+
+    # RA/DEC -> degrees (keep original RA/DEC strings too)
+    c = SkyCoord(df['RA'], df['DEC'], unit=('hourangle', 'deg'))
+    df['RA_deg']  = c.ra.deg
+    df['DEC_deg'] = c.dec.deg
+
+    # parse & normalize motion rates to arcsec/min
+    src_ra = None
+    src_de = None
+    for cand in ['RA_rate', 'SkyMotion (RA)']:
+        if cand in df.columns:
+            src_ra = df[cand]
+            break
+    for cand in ['Dec_rate', 'SkyMotion (DEC)']:
+        if cand in df.columns:
+            src_de = df[cand]
+            break
+    df['ra_rate']  = pd.Series(np.nan, index=df.index) if src_ra is None else src_ra.apply(_parse_rate_as_asmin)
+    df['dec_rate'] = pd.Series(np.nan, index=df.index) if src_de is None else src_de.apply(_parse_rate_as_asmin)
+
+    # d_total (if available)
+    if 'RA_rate' in df.columns and 'Dec_rate' in df.columns:
+        df['d_total'] = np.sqrt(pd.to_numeric(df['ra_rate'], errors='coerce')**2 +
+                                pd.to_numeric(df['dec_rate'], errors='coerce')**2)
+    elif 'd_total' not in df.columns:
+        df['d_total'] = 0.0
+
+    # return selected columns
+    want = ['Date','RA','DEC','Vmag','Alt','Sun_Alt',
+            'Elongation','Phase','Delta (AU)','r (AU)','d_total','ra_rate','dec_rate','Object','unc']
+    out_cols = [c for c in want if c in df.columns]
+    return df[out_cols]
+
+# ========================= Interpolation helpers =========================
+def gp_interpolate_curve(t, y, n_points=600, length_scale=1.0, noise_level=1e-2, alpha=0.1):
+    """GPR interp with robust handling for TimedeltaIndex/DatetimeIndex."""
+    t_ser = pd.to_datetime(pd.Series(t), format="%Y-%m-%d %H:%M:%S", errors="coerce")
+    y_ser = pd.Series(y)
+    mask = t_ser.notna() & y_ser.notna()
+    t_ser = t_ser[mask]
+    y_ser = y_ser[mask].astype(float)
+
+    if len(t_ser) == 0:
+        return [], np.array([])
+    if len(t_ser) == 1:
+        return [t_ser.iloc[0].strftime("%Y-%m-%d %H:%M:%S")] * n_points, np.full(n_points, float(y_ser.iloc[0]))
+
+    t0 = t_ser.min()
+    t1 = t_ser.max()
+    total_seconds = (t1 - t0).total_seconds()
+    t_seconds = (t_ser - t0).dt.total_seconds().to_numpy().reshape(-1, 1)
+    t_normalized = t_seconds / total_seconds
+
+    kernel = RationalQuadratic(length_scale=length_scale, alpha=alpha) + WhiteKernel(noise_level=noise_level)
+    gp = GaussianProcessRegressor(kernel=kernel, normalize_y=True)
+    gp.fit(t_normalized, y_ser.to_numpy())
+
+    t_interp_normalized = np.linspace(0, 1, n_points).reshape(-1, 1)
+    y_interp = gp.predict(t_interp_normalized)
+
+    t_interp_seconds = t_interp_normalized.flatten() * total_seconds
+    t_interp_dt = [t0 + timedelta(seconds=float(s)) for s in t_interp_seconds]
+    t_interp_str = [dt.strftime("%Y-%m-%d %H:%M:%S") for dt in t_interp_dt]
+    return t_interp_str, y_interp
+
+
+# def interp_radec_minutely_slerp(t_list, ra_deg_list, dec_deg_list, n_points=None):
+#     """
+#     逐段最短弧球面插值（SLERP），按 1 分钟时间栅格返回 (t_str, RA_deg, DEC_deg)。
+#     - t_list: 原始时间序列（可混合 str / pandas.Timestamp）
+#     - ra_deg_list, dec_deg_list: 原始 RA/DEC（单位：度，可带 wrap）
+#     - n_points: 可选；若提供，则把结果裁剪到前 n_points 个采样（保持兼容）
+#     """
+#     import numpy as np
+#     import pandas as pd
+
+#     # 1) 清洗 & 排序
+#     t = pd.to_datetime(pd.Series(t_list), errors="coerce", utc=True)
+#     ra = pd.to_numeric(pd.Series(ra_deg_list), errors="coerce")
+#     de = pd.to_numeric(pd.Series(dec_deg_list), errors="coerce")
+#     m = t.notna() & ra.notna() & de.notna()
+#     t, ra, de = t[m], ra[m], de[m]
+#     if len(t) == 0:
+#         return [], np.array([]), np.array([])
+#     if len(t) == 1:
+#         t0 = t.iloc[0].floor("T")
+#         t1 = t.iloc[0].ceil("T")
+#         grid = pd.date_range(t0, t1, freq="T")
+#         ra0 = float(ra.iloc[0]) % 360.0
+#         de0 = float(de.iloc[0])
+#         if n_points and len(grid) > n_points:
+#             grid = grid[:n_points]
+#         return [dt.strftime("%Y-%m-%d %H:%M:%S") for dt in grid], \
+#                np.full(len(grid), ra0), np.full(len(grid), de0)
+
+#     order = np.argsort(t.values)
+#     t  = t.iloc[order].reset_index(drop=True)
+#     ra = (ra.iloc[order].astype(float) % 360.0).reset_index(drop=True)
+#     de =  de.iloc[order].astype(float).reset_index(drop=True)
+
+#     # 2) 构建整分钟栅格
+#     t0 = t.min().floor("T")
+#     t1 = t.max().ceil("T")
+#     grid = pd.date_range(t0, t1, freq="T")  # 每分钟
+#     if len(grid) == 0:
+#         grid = pd.DatetimeIndex([t0])
+
+#     # 3) 时间轴 -> 秒，并找每个网格点所在区间 [ti, ti+1]
+#     src_sec = (t - t0).dt.total_seconds().to_numpy()
+#     dst_sec = np.asarray((grid - t0).total_seconds(), dtype=float)
+
+#     right = np.searchsorted(src_sec, dst_sec, side="right")
+#     left  = np.clip(right - 1, 0, len(src_sec) - 2)
+#     right = left + 1
+
+#     # 4) 段内归一化时间 alpha in [0,1]
+#     seg_len = src_sec[right] - src_sec[left]
+#     seg_len[seg_len == 0] = 1.0
+#     alpha = (dst_sec - src_sec[left]) / seg_len
+#     alpha = np.asarray(alpha, dtype=float)
+
+#     # 5) RA/DEC -> 单位向量
+#     ra_l = np.deg2rad(ra.to_numpy())
+#     de_l = np.deg2rad(de.to_numpy())
+#     c = np.cos(de_l)
+#     x = c * np.cos(ra_l)
+#     y = c * np.sin(ra_l)
+#     z = np.sin(de_l)
+
+#     # 6) 端点向量
+#     v0 = np.stack([x[left],  y[left],  z[left]],  axis=1)  # (N,3)
+#     v1 = np.stack([x[right], y[right], z[right]], axis=1)  # (N,3)
+
+#     # 7) SLERP
+#     dot = np.einsum("ij,ij->i", v0, v1)
+#     dot = np.clip(dot, -1.0, 1.0)
+#     theta = np.arccos(dot)
+#     sin_th = np.sin(theta)
+#     use_lerp = sin_th < 1e-12
+
+#     out = np.empty_like(v0)
+
+#     # 线性插值（小角度）
+#     if np.any(use_lerp):
+#         a_lin = alpha[use_lerp][:, None] 
+#         out[use_lerp] = (1 - a_lin) * v0[use_lerp] + a_lin * v1[use_lerp]
+
+#     # 标准 SLERP
+#     if np.any(~use_lerp):
+#         a = np.asarray(alpha[~use_lerp], dtype=float)
+#         th = np.asarray(theta[~use_lerp], dtype=float)
+#         s0 = np.sin((1 - a) * th) / np.sin(th)
+#         s1 = np.sin(a * th)        / np.sin(th)
+#         s0 = np.asarray(s0, dtype=float)[:, None]
+#         s1 = np.asarray(s1, dtype=float)[:, None]
+#         out[~use_lerp] = s0 * v0[~use_lerp] + s1 * v1[~use_lerp]
+
+#     # 8) 归一化并转回 RA/DEC
+#     nrm = np.linalg.norm(out, axis=1, keepdims=True)
+#     nrm[nrm == 0] = 1.0
+#     out /= nrm
+#     ox, oy, oz = out[:, 0], out[:, 1], out[:, 2]
+#     ra_i  = (np.degrees(np.arctan2(oy, ox)) + 360.0) % 360.0
+#     dec_i =  np.degrees(np.arcsin(np.clip(oz, -1.0, 1.0)))
+
+#     t_str = [dt.strftime("%Y-%m-%d %H:%M:%S") for dt in grid]
+#     if n_points and len(t_str) > n_points:
+#         t_str  = t_str[:n_points]
+#         ra_i   = ra_i[:n_points]
+#         dec_i  = dec_i[:n_points]
+
+#     return t_str, ra_i, dec_i
+
+def gp_interpolate_curve_alt(t, y, n_points=600, length_scale=1.0, noise_level=1e-2, rbf_length_scale=10000):
+    """Alternative GPR (periodic × RBF) with robust time axis."""
+    t_ser = pd.to_datetime(pd.Series(t), format="%Y-%m-%d %H:%M:%S", errors="coerce")
+    y_ser = pd.Series(y)
+    mask = t_ser.notna() & y_ser.notna()
+    t_ser = t_ser[mask]
+    y_ser = y_ser[mask].astype(float)
+
+    if len(t_ser) == 0:
+        return [], np.array([])
+    if len(t_ser) == 1:
+        return [t_ser.iloc[0].strftime("%Y-%m-%d %H:%M:%S")] * n_points, np.full(n_points, float(y_ser.iloc[0]))
+
+    t0 = t_ser.min()
+    t_sec = ((t_ser - t0) / np.timedelta64(1, 's')).to_numpy()
+
+    t_uniform = np.linspace(t_sec.min(), t_sec.max(), len(t_sec))
+    y_uniform = np.interp(t_uniform, t_sec, y_ser.to_numpy())
+    y_detrended = detrend(y_uniform)
+    yf = rfft(y_detrended)
+    xf = rfftfreq(len(t_uniform), d=(t_uniform[1] - t_uniform[0]))
+    peak = np.argmax(np.abs(yf[1:])) + 1
+    period = 1 / xf[peak]
+
+    kernel = (ExpSineSquared(length_scale=length_scale, periodicity=period) + WhiteKernel(noise_level=noise_level)) * RBF(length_scale=rbf_length_scale)
+    gp = GaussianProcessRegressor(kernel=kernel, normalize_y=True)
+    gp.fit(t_sec.reshape(-1, 1), y_ser.to_numpy())
+
+    t_interp_sec = np.linspace(t_sec.min(), t_sec.max(), n_points)
+    y_interp = gp.predict(t_interp_sec.reshape(-1, 1))
+
+    t_interp_dt  = [t0 + timedelta(seconds=float(s)) for s in t_interp_sec]
+    t_interp_str = [d.strftime("%Y-%m-%d %H:%M:%S") for d in t_interp_dt]
+    return t_interp_str, y_interp
+
+def sort_ephemerides_by_object_df(data: pd.DataFrame):
+    data = data.copy()
+    data['datetime'] = pd.to_datetime(data['Date'], errors='coerce', utc=True)
+    unique_objects = data["Object"].unique()
+    out = []
+    for obj in unique_objects:
+        obj_data = data[data["Object"] == obj]
+        t_l    = obj_data["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+        x      = obj_data["RA"].tolist()
+        y      = obj_data["DEC"].tolist()
+        z      = obj_data.get("Alt", pd.Series([np.nan]*len(obj_data))).tolist()
+        z_sun  = obj_data.get("Sun_Alt", pd.Series([np.nan]*len(obj_data))).tolist()
+        mag    = obj_data.get("Vmag", pd.Series([np.nan]*len(obj_data))).tolist()
+        d_total= obj_data.get("d_total", pd.Series([0.0]*len(obj_data))).tolist()
+        unc = obj_data.get("unc", pd.Series([0.0]*len(obj_data))).tolist()
+
+        # rates: prefer 'ra_rate'/'dec_rate', fallback to 'SkyMotion (RA/DEC)' if user changes upstream
+        xrate_src = obj_data.get("ra_rate", pd.Series([np.nan]*len(obj_data)))
+        if xrate_src.isna().all() and "SkyMotion (RA)" in obj_data.columns:
+            xrate_src = obj_data["SkyMotion (RA)"]
+        yrate_src = obj_data.get("dec_rate", pd.Series([np.nan]*len(obj_data)))
+        if yrate_src.isna().all() and "SkyMotion (DEC)" in obj_data.columns:
+            yrate_src = obj_data["SkyMotion (DEC)"]
+        xrate  = pd.to_numeric(xrate_src, errors='coerce').tolist()
+        yrate  = pd.to_numeric(yrate_src, errors='coerce').tolist()
+
+        out.append([t_l, x, y, z, z_sun, mag, None, d_total, xrate, yrate,unc])
+    return out
+
+def batch_fetch_ephemerides(obj_list, start_date, interval, step_count,
+                            site_lon, site_lat, site_height,
+                            n_points=96*60*60+1):
+    """
+    Build dense/interpolated ephemerides per object for given site.
+    Returns columns: datetime, RA, DEC, ALT, Sun_Alt, obj_name, Vmag, unc, d_total, ra_rate, dec_rate
+    """
+    if isinstance(obj_list, pd.DataFrame):
+        if 'Obj_Value' in obj_list.columns:
+            obj_list = obj_list['Obj_Value'].tolist()
+        elif 'Obj_Name' in obj_list.columns:
+            obj_list = obj_list['Obj_Name'].tolist()
+        else:
+            raise ValueError("DataFrame must contain 'Obj_Value' or 'Obj_Name'.")
+    elif isinstance(obj_list, pd.Series):
+        obj_list = obj_list.tolist()
+    elif not isinstance(obj_list, list):
+        raise TypeError("obj_list must be list/Series/DataFrame")
+
+    df_all = pd.DataFrame(columns=[
+        "datetime","RA","DEC","ALT","Sun_Alt","obj_name",
+        "Vmag",'unc',"d_total","ra_rate","dec_rate"
+    ])
+
+    for obj_value in tqdm(obj_list, desc="Ephemerides", unit="obj"):
+        try:
+            df = fetch_ephemeris(
+                target_name=obj_value,
+                start_date=start_date,
+                interval_min=interval,
+                step_count=step_count,
+                site_lon=site_lon,
+                site_lat=site_lat,
+                site_height=site_height
+            )
+            if df.empty:
+                continue
+
+            sorted_data = sort_ephemerides_by_object_df(df)
+            if not sorted_data:
+                continue
+
+            for item in sorted_data:
+                (t_l, ra_l, dec_l, alt_l, sun_l, mag_l, _, dtot_l, xrate_l, yrate_l,unc_l) = item
+                
+                # t_int, ra_int, dec_int = interp_radec_minutely_slerp(t_l,ra_l, dec_l, n_points=n_points)
+                t_int, ra_int =  gp_interpolate_curve(t_l,ra_l, n_points=n_points, length_scale=0.2, noise_level=1e-2, alpha=0.1)
+                t_int, dec_int =  gp_interpolate_curve(t_l,dec_l, n_points=n_points, length_scale=0.2, noise_level=1e-2, alpha=0.1)
+                
+
+                # 基准长度：三者的最小公共长度
+                L = min(len(t_int), len(ra_int), len(dec_int))
+
+                # 统一裁剪/填充
+                t_int   = list(t_int[:L])
+                ra_int  = ensure_list_length(ra_int,  L, fill=np.nan)
+                dec_int = ensure_list_length(dec_int, L, fill=np.nan)
+
+                # 其他量插值/填充到长度 L
+                _, alt_int   = gp_interpolate_curve_alt(t_l, alt_l,  n_points=n_points, length_scale=1.0, noise_level=1e-2)
+                _, s_alt_int = gp_interpolate_curve_alt(t_l, sun_l,  n_points=n_points, length_scale=1.0, noise_level=1e-2)
+                _, mag_int   = gp_interpolate_curve_alt(t_l, mag_l,  n_points=n_points, length_scale=1.0, noise_level=1e-2)
+                _, dtot_int  = gp_interpolate_curve_alt(t_l, dtot_l, n_points=n_points, length_scale=1.0, noise_level=1e-2)
+                _, unc_int = gp_interpolate_curve_alt(t_l, unc_l, n_points=n_points, length_scale=1.0, noise_level=1e-2)
+                
+                alt_int   = ensure_list_length(alt_int,   L, fill=np.nan)
+                s_alt_int = ensure_list_length(s_alt_int, L, fill=np.nan)
+                mag_int   = ensure_list_length(mag_int,   L, fill=np.nan)
+                dtot_int  = ensure_list_length(dtot_int,  L, fill=np.nan)
+                unc_int  = ensure_list_length(unc_int,  L, fill=np.nan)
+
+                # 速率插值（若返回空，则填 NaN），再统一到长度 L
+                def _safe_interp_rate(vals):
+                    _, arr = gp_interpolate_curve_alt(t_l, vals, n_points=n_points, length_scale=1.0, noise_level=1e-2)
+                    return arr if arr is not None and len(arr) > 0 else []
+
+                ra_rate_int  = ensure_list_length(_safe_interp_rate(xrate_l), L, fill=np.nan)
+                dec_rate_int = ensure_list_length(_safe_interp_rate(yrate_l), L, fill=np.nan)
+
+                # --- 先建基表，再逐列赋值（彻底避免长度不一致） ---
+                df_temp = pd.DataFrame({"datetime": t_int})
+                df_temp["RA"]        = ra_int
+                df_temp["DEC"]       = dec_int
+                df_temp["ALT"]       = alt_int
+                df_temp["Sun_Alt"]   = s_alt_int
+                df_temp["obj_name"]  = obj_value
+                df_temp["Vmag"]      = mag_int
+                df_temp["unc"]       = unc_int
+                df_temp["d_total"]   = dtot_int
+                df_temp["ra_rate"]   = ra_rate_int
+                df_temp["dec_rate"]  = dec_rate_int
+
+                df_all = pd.concat([df_all, df_temp], ignore_index=True)
+
+        except Exception as e:
+            lens = {}
+            for var in ("t_int","ra_int","dec_int","alt_int","s_alt_int","mag_int","dtot_int","ra_rate_int","dec_rate_int"):
+                if var in locals():
+                    try:
+                        lens[var] = len(eval(var))
+                    except Exception:
+                        lens[var] = "NA"
+            tqdm.write(f"⚠️  Failed to fetch {obj_value}: {e} | lens={lens}")
+            continue
+
+    return df_all
+
+
+
+# def match_ephemeris_by_site(combined_df, recent_obs_df,
+#                             time_tolerance_sec=2, per_minute_cap=None):
+#     """
+#     Merge ephemerides (dense) with observations by site and time, then filter by footprint.
+#     NOTE:
+#       - Method replaced with STRtree-based spatial query + strict time tolerance.
+#       - I/O kept identical to old version (same args and returned columns).
+#       - No RA wrap; use polygon.contains (not covers).
+#       - No extra robust parsing beyond existing safe_parse_footprint usage.
+#     """
+#     import pandas as pd
+#     import numpy as np
+#     from shapely.geometry import Point
+#     from shapely.strtree import STRtree
+#     from tqdm import tqdm
+
+#     # ---------- helpers ----------
+#     def _require_cols(df, cols, name):
+#         missing = [c for c in cols if c not in df.columns]
+#         if missing:
+#             raise KeyError(f"{name} missing columns: {', '.join(missing)}")
+
+#     # Copy & normalize
+#     comb = combined_df.copy()
+#     rec  = recent_obs_df.copy()
+#     comb.columns = [c.strip().lower() for c in comb.columns]
+#     rec.columns  = [c.strip().lower() for c in rec.columns]
+
+#     # Minimal column checks 
+#     _require_cols(comb, ['datetime', 'ra', 'dec'], "combined_df")
+#     _require_cols(rec,  ['obs_date_utc', 'astrom_footprint'], "recent_obs_df")
+
+#     # site keys
+#     comb['site_key'] = comb.get('site', "").astype(str).str.strip().str.lower()
+#     rec ['site_key'] = rec.get('site', "").astype(str).str.strip().str.lower()
+
+#     # time to UTC 
+#     comb['datetime_utc'] = pd.to_datetime(comb['datetime'], utc=True,  errors='coerce')
+#     rec ['obs_date_utc'] = pd.to_datetime(rec['obs_date_utc'], utc=True, errors='coerce')
+
+#     # numeric coords
+#     comb['ra']  = pd.to_numeric(comb['ra'],  errors='coerce')
+#     comb['dec'] = pd.to_numeric(comb['dec'], errors='coerce')
+
+#     # drop NA rows minimally
+#     comb = comb.dropna(subset=['datetime_utc','site_key','ra','dec'])
+#     rec  = rec.dropna(subset=['obs_date_utc','site_key','astrom_footprint'])
+
+#     # parse footprints using existing helper 
+#     rec['polygon'] = [safe_parse_footprint(v) for v in tqdm(rec['astrom_footprint'].tolist(),
+#                                                             desc="Polygons", unit="fp")]
+#     rec = rec[rec['polygon'].notna()]
+
+#     if comb.empty or rec.empty:
+#         print("[END] Nothing to match after filtering.")
+#         return pd.DataFrame(columns=[
+#             'name','RA','DEC','site','obs_time','telescope','filepath','limiting_mag',
+#             'Vmag','unc','d_total','ra_rate','dec_rate','time_diff_s','id'
+#         ])
+
+#     # keep original site labels if present
+#     comb['site_orig'] = combined_df['site'] if 'site' in combined_df.columns else comb['site_key']
+#     rec ['site_orig'] = recent_obs_df['site'] if 'site' in recent_obs_df.columns else rec['site_key']
+
+#     # helpful index for lookups
+#     rec['obs_idx'] = rec.index
+
+#     out_rows = []
+#     seen_obs = set()   
+
+#     # ------------ per-site loop with STRtree ------------
+#     for site_key, grp_obs in tqdm(list(rec.groupby('site_key', sort=False)), desc="Sites", unit="site"):
+#         # ephemerides for this site
+#         eph_site = comb[comb['site_key'] == site_key]
+#         if eph_site.empty or grp_obs.empty:
+#             tqdm.write(f"[SKIP] site={site_key} (eph={len(eph_site)}, obs={len(grp_obs)})")
+#             continue
+
+#         # build STRtree for this site's polygons
+#         polys = grp_obs['polygon'].tolist()
+#         tree  = STRtree(polys)
+
+#         # meta dicts（与旧版一致的可选字段）
+#         meta_cols = [c for c in ['telescope','limiting_mag','filepath','id','obs_date'] if c in grp_obs.columns]
+#         meta_map  = grp_obs.set_index('obs_idx')[meta_cols].to_dict('index') if meta_cols else {}
+
+#         # iterate ephemerides (dense)
+#         for r in tqdm(eph_site.itertuples(index=False), total=len(eph_site), desc="searching", leave=False):
+#             pt = Point(float(r.ra), float(r.dec))
+#             t0 = pd.Timestamp(r.datetime_utc)
+
+#             # spatial candidates via STRtree
+#             cand = tree.query(pt)
+#             idx_list = []
+#             if len(cand) > 0:
+#                 if isinstance(cand[0], (int, np.integer)):
+#                     idx_list = list(cand)
+#                 else:
+#                     geom_to_idx = {poly: i for i, poly in enumerate(polys)}
+#                     idx_list = [geom_to_idx[g] for g in cand if g in geom_to_idx]
+
+#             # fine spatial check: contains
+#             for idx in idx_list:
+#                 poly = polys[int(idx)]
+#                 if not poly.contains(pt):
+#                     continue
+
+#                 obs_row = grp_obs.iloc[int(idx)]
+#                 obs_idx = int(obs_row.obs_idx)
+
+#                 if obs_idx in seen_obs:
+#                     continue
+
+#                 # time tolerance 
+#                 t_obs = pd.Timestamp(obs_row.obs_date_utc)
+#                 dt_s  = abs((t0 - t_obs).total_seconds())
+#                 if dt_s > float(time_tolerance_sec):
+#                     continue
+
+#                 # mark used once matched（新版行为）
+#                 seen_obs.add(obs_idx)
+
+#                 # assemble output row
+#                 name     = getattr(r, 'obj_name', None)
+#                 vmag     = getattr(r, 'vmag',     None)
+#                 unc      = getattr(r, 'unc',      None)
+#                 d_total  = getattr(r, 'd_total',  None)
+#                 ra_rate  = getattr(r, 'ra_rate',  None)
+#                 dec_rate = getattr(r, 'dec_rate', None)
+
+#                 meta = meta_map.get(obs_idx, {})
+#                 out_rows.append({
+#                     'name'        : None if pd.isna(name)     else name,
+#                     'RA'          : float(r.ra),
+#                     'DEC'         : float(r.dec),
+#                     'site'        : r.site_orig if 'site_orig' in eph_site.columns else site_key,
+#                     'obs_time'    : meta.get('obs_date', None),  
+#                     'telescope'   : meta.get('telescope'),
+#                     'filepath'    : meta.get('filepath'),
+#                     'limiting_mag': meta.get('limiting_mag'),
+#                     'Vmag'        : None if (vmag     is None or pd.isna(vmag))     else float(vmag),
+#                     'unc'         : None if (unc      is None or pd.isna(unc))      else float(unc),
+#                     'd_total'     : None if (d_total  is None or pd.isna(d_total))  else float(d_total),
+#                     'ra_rate'     : None if (ra_rate  is None or pd.isna(ra_rate))  else float(ra_rate),
+#                     'dec_rate'    : None if (dec_rate is None or pd.isna(dec_rate)) else float(dec_rate),
+#                     'time_diff_s' : float(dt_s),
+#                     'id'          : meta.get('id'),
+#                 })
+
+#     # 返回与旧版一致的列集合顺序
+#     return pd.DataFrame(out_rows, columns=[
+#         'name','RA','DEC','site','obs_time','telescope','filepath','limiting_mag',
+#         'Vmag','unc','d_total','ra_rate','dec_rate','time_diff_s','id'
+#     ])
+
+def match_ephemeris_by_site(combined_df, recent_obs_df,
+                            time_tolerance_sec=2, per_minute_cap=None):
+    """
+    Vectorized great-circle (spherical) inside-test using half-space normals.
+    For each observation, only compare the time-nearest ephemeris point per object.
+    I/O columns/semantics match the older function.
+
+    Requires:
+      - combined_df columns: datetime, ra, dec, (optional) obj_name or name, site
+      - recent_obs_df columns: obs_date_utc, astrom_footprint, (optional) site, telescope, limiting_mag, filepath, id, obs_date
+      - safe_parse_footprint(v) -> shapely Polygon with (lon=RA_deg, lat=DEC_deg) exterior
+    """
+    import pandas as pd
+    import numpy as np
+    from tqdm import tqdm
+    from math import radians, sin, cos
+    # ---------- helpers ----------
+    def _require_cols(df, cols, name):
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            raise KeyError(f"{name} missing columns: {', '.join(missing)}")
+
+    def _radec_deg_to_unit(ra_deg, dec_deg):
+        ra = np.deg2rad(ra_deg)
+        dec = np.deg2rad(dec_deg)
+        c = np.cos(dec)
+        return np.stack([c*np.cos(ra), c*np.sin(ra), np.sin(dec)], axis=-1)
+
+    def _normalize_rows(v):
+        n = np.linalg.norm(v, axis=-1, keepdims=True)
+        n = np.where(n == 0, 1.0, n)
+        return v / n
+
+    def _poly_to_unit_vertices(poly):
+        """
+        poly: shapely Polygon whose exterior coords are (RA_deg, DEC_deg).
+        Returns (V, E): V = Nx3 unit vectors; E = edge-index pairs [(0,1),(1,2),...,(N-1,0)]
+        Ensures vertices are unique enough (drops repeated last==first).
+        """
+        xs, ys = np.asarray(poly.exterior.coords.xy[0]), np.asarray(poly.exterior.coords.xy[1])
+        coords = np.stack([xs, ys], axis=1)
+        if len(coords) >= 2 and np.allclose(coords[0], coords[-1], atol=1e-9):
+            coords = coords[:-1]
+        # guard tiny polygons
+        if coords.shape[0] < 3:
+            return None, None
+        V = _radec_deg_to_unit(coords[:, 0], coords[:, 1])  # (N,3)
+        Nv = V.shape[0]
+        E = np.stack([np.arange(Nv), (np.arange(Nv)+1) % Nv], axis=1)
+        return V, E
+
+    def _edge_inward_normals(V, E):
+        """
+        For each edge (i->j), normal n = normalize( cross(V_i, V_j) ).
+        Then flip sign so that dot(n, centroid) > 0 (i.e., normals point inward).
+        Returns normals with shape (Ne, 3).
+        """
+        Vi = V[E[:, 0]]  # (Ne,3)
+        Vj = V[E[:, 1]]  # (Ne,3)
+        n = np.cross(Vi, Vj)  # (Ne,3) normal to the great-circle plane
+        n = _normalize_rows(n)
+        # centroid direction ~ mean of vertices
+        c = _normalize_rows(V.mean(axis=0, keepdims=True))  # (1,3)
+        sign = np.sign(np.einsum('ij, kj->i', n, c))  # (Ne,)
+        sign[sign == 0] = 1.0
+        n *= sign[:, None]
+        return n
+
+    # Copy & normalize
+    comb = combined_df.copy()
+    rec  = recent_obs_df.copy()
+    comb.columns = [c.strip().lower() for c in comb.columns]
+    rec.columns  = [c.strip().lower() for c in rec.columns]
+
+    # Minimal column checks 
+    _require_cols(comb, ['datetime', 'ra', 'dec'], "combined_df")
+    _require_cols(rec,  ['obs_date_utc', 'astrom_footprint'], "recent_obs_df")
+
+    # site keys
+    comb['site_key'] = comb.get('site', "").astype(str).str.strip().str.lower()
+    rec ['site_key'] = rec.get('site', "").astype(str).str.strip().str.lower()
+
+    # time to UTC 
+    comb['datetime_utc'] = pd.to_datetime(comb['datetime'], utc=True,  errors='coerce')
+    rec ['obs_date_utc'] = pd.to_datetime(rec['obs_date_utc'], utc=True, errors='coerce')
+
+    # numeric coords
+    comb['ra']  = pd.to_numeric(comb['ra'],  errors='coerce')
+    comb['dec'] = pd.to_numeric(comb['dec'], errors='coerce')
+
+    # object name column harmonization
+    if 'obj_name' in comb.columns:
+        obj_col = 'obj_name'
+    elif 'name' in comb.columns:
+        obj_col = 'name'
+    else:
+        obj_col = None  # fallback: treat all as one group
+
+    # drop NA rows minimally
+    comb = comb.dropna(subset=['datetime_utc','site_key','ra','dec'])
+    rec  = rec.dropna(subset=['obs_date_utc','site_key','astrom_footprint'])
+
+    # keep original site labels if present
+    comb['site_orig'] = combined_df['site'] if 'site' in combined_df.columns else comb['site_key']
+    rec ['site_orig'] = recent_obs_df['site'] if 'site' in recent_obs_df.columns else rec['site_key']
+
+    # parse footprints to spherical edge normals
+    polys = []
+    normals_pack = []  # list of (Ne,3) inward normals per obs
+    valid_idx = []
+    from tqdm import tqdm as _tqdm
+    for i, v in enumerate(_tqdm(rec['astrom_footprint'].tolist(), desc="Footprints->normals", unit="fp")):
+        poly = safe_parse_footprint(v)
+        if poly is None:
+            continue
+        V, E = _poly_to_unit_vertices(poly)
+        if V is None:
+            continue
+        n = _edge_inward_normals(V, E)
+        polys.append(poly)
+        normals_pack.append(n)   # (Ne,3)
+        valid_idx.append(i)
+
+    if len(valid_idx) == 0 or comb.empty:
+        print("[END] Nothing to match after filtering.")
+        return pd.DataFrame(columns=[
+            'name','RA','DEC','site','obs_time','telescope','filepath','limiting_mag',
+            'Vmag','unc','d_total','ra_rate','dec_rate','time_diff_s','id'
+        ])
+
+    rec = rec.iloc[valid_idx].copy()
+    rec['normals_idx'] = np.arange(len(valid_idx))  # align with normals_pack
+
+    # Precompute ephemeris unit vectors
+    comb['eph_vec'] = list(_radec_deg_to_unit(comb['ra'].values, comb['dec'].values))  # each row -> (3,)
+
+    # Optional meta dicts from observations
+    meta_cols = [c for c in ['telescope','limiting_mag','filepath','id','obs_date'] if c in rec.columns]
+    rec_idx = np.arange(len(rec))
+    rec['__obs_idx__'] = rec_idx
+    meta_map = rec.set_index('__obs_idx__')[meta_cols].to_dict('index') if meta_cols else {}
+
+    out_rows = []
+
+    # ------------ per-site loop ------------
+    for site_key, grp_obs in _tqdm(list(rec.groupby('site_key', sort=False)), desc="Sites", unit="site"):
+        eph_site = comb[comb['site_key'] == site_key]
+        if eph_site.empty or grp_obs.empty:
+            continue
+
+        # group ephemeris per object (or all-as-one if no obj_col)
+        if obj_col is not None:
+            groups = list(eph_site.groupby(obj_col, sort=False))
+        else:
+            groups = [(None, eph_site)]
+
+        # Prepare observation times & normals
+        T_obs = grp_obs['obs_date_utc'].to_numpy(dtype='datetime64[ns]')
+        T_obs_ns = T_obs.astype('datetime64[ns]').astype('int64')  # ns since epoch
+        tol_ns = int(float(time_tolerance_sec) * 1e9)
+
+        # For fast writes
+        obs_rows = grp_obs.reset_index(drop=True)
+
+        # For each object group, for every obs choose the nearest eph time index (vectorized)
+        for obj_name, g in groups:
+            g_sorted = g.sort_values('datetime_utc').reset_index(drop=False)  # keep original row index
+            if g_sorted.empty:
+                continue
+            t_eph = g_sorted['datetime_utc'].to_numpy(dtype='datetime64[ns]').astype('int64')  # ns
+            # searchsorted to find nearest
+            pos = np.searchsorted(t_eph, T_obs_ns, side='left')  # index where to insert
+            pos0 = np.clip(pos - 1, 0, len(t_eph)-1)
+            pos1 = np.clip(pos,     0, len(t_eph)-1)
+            # choose nearer
+            left_dt  = np.abs(T_obs_ns - t_eph[pos0])
+            right_dt = np.abs(T_obs_ns - t_eph[pos1])
+            take_right = right_dt < left_dt
+            nearest_idx_in_group = np.where(take_right, pos1, pos0)  # shape (Nobs,)
+
+            # Candidate eph rows for each obs (one per object)
+            cand_rows = g_sorted.iloc[nearest_idx_in_group]
+
+            # Time filter first (vectorized)
+            dt_ns = np.abs(T_obs_ns - cand_rows['datetime_utc'].to_numpy(dtype='datetime64[ns]').astype('int64'))
+            time_ok = dt_ns <= tol_ns
+            if not np.any(time_ok):
+                continue
+
+            # Build arrays of unit vectors and normals for time-ok pairs
+            eph_vecs = np.stack(cand_rows.loc[time_ok, 'eph_vec'].to_list(), axis=0)  # (K,3)
+            # normals per obs: jagged; compute per obs in a small loop, but inner math is vectorized
+            ok_obs_idx = np.nonzero(time_ok)[0]  # indices within obs_rows
+            # compute inside-test per obs independently to avoid padding
+            for j_local, j_obs in enumerate(ok_obs_idx):
+                normals = normals_pack[int(obs_rows.loc[j_obs, 'normals_idx'])]  # (Ne,3)
+                if normals is None or normals.size == 0:
+                    continue
+                v = eph_vecs[j_local:j_local+1, :]  # (1,3)
+                # (Ne,3) @ (3,1K) -> (Ne,1)
+                dots = normals @ v.T  # (Ne,1)
+                inside = np.all(dots > 0.0)  # scalar
+                if not inside:
+                    continue
+
+                # assemble output row
+                eph_row   = cand_rows.iloc[j_obs]
+                obs_row   = obs_rows.iloc[j_obs]
+                meta      = meta_map.get(int(obs_row['__obs_idx__']), {}) if meta_map else {}
+
+                name     = eph_row.get('obj_name', eph_row.get('name', None))
+                vmag     = eph_row.get('vmag',     None)
+                unc      = eph_row.get('unc',      None)
+                d_total  = eph_row.get('d_total',  None)
+                ra_rate  = eph_row.get('ra_rate',  None)
+                dec_rate = eph_row.get('dec_rate', None)
+                dt_s     = float(dt_ns[j_obs] * 1e-9)
+
+                out_rows.append({
+                    'name'        : None if pd.isna(name)     else name,
+                    'RA'          : float(eph_row['ra']),
+                    'DEC'         : float(eph_row['dec']),
+                    'site'        : eph_row['site_orig'] if 'site_orig' in eph_row else site_key,
+                    'obs_time'    : meta.get('obs_date', None),
+                    'telescope'   : meta.get('telescope'),
+                    'filepath'    : meta.get('filepath'),
+                    'limiting_mag': meta.get('limiting_mag'),
+                    'Vmag'        : None if (vmag     is None or pd.isna(vmag))     else float(vmag),
+                    'unc'         : None if (unc      is None or pd.isna(unc))      else float(unc),
+                    'd_total'     : None if (d_total  is None or pd.isna(d_total))  else float(d_total),
+                    'ra_rate'     : None if (ra_rate  is None or pd.isna(ra_rate))  else float(ra_rate),
+                    'dec_rate'    : None if (dec_rate is None or pd.isna(dec_rate)) else float(dec_rate),
+                    'time_diff_s' : dt_s,
+                    'id'          : meta.get('id'),
+                })
+
+    # 返回与旧版一致的列集合顺序
+    return pd.DataFrame(out_rows, columns=[
+        'name','RA','DEC','site','obs_time','telescope','filepath','limiting_mag',
+        'Vmag','unc','d_total','ra_rate','dec_rate','time_diff_s','id'
+    ])
+
+
+# ========================= Main =========================
+
+def main():
+    parser = argparse.ArgumentParser(description="Ephemeris—Observation matcher (image.single, no per-minute dedupe, rates only)")
+    # Ephemeris inputs
+    parser.add_argument("--mag-limit", type=str, default="19.5", help="MPC Customize magnitude limit")
+    parser.add_argument("--interval", type=int, default=36, help="Ephemeris step minutes")
+    parser.add_argument("--steps", type=int, default=121, help="Ephemeris number of steps")
+    parser.add_argument("--npoints", type=int, default=96*60*60+1, help="Interpolation points per object")
+    parser.add_argument("--start-utc", type=str, default=None, help="Ephemeris start UTC (YYYY-MM-DD or full)")
+    # Observations
+    parser.add_argument("--lookback-days", type=int, default=3, help="Observation lookback days from last footprint time")
+    parser.add_argument("--only-has-footprint", action="store_true", default=True, help="Only include rows with footprint")
+    # Matching
+    parser.add_argument("--time-tol", type=int, default=60, help="Time tolerance seconds for merge_asof")
+    parser.add_argument("--per-minute-cap", type=int, default=None, help="(Deprecated, not used) Max picks per object per observation")
+    # Output
+    parser.add_argument("--outfile", type=str, default="", help="Output CSV path")
+
+    args = parser.parse_args()
+
+    print("[STEP] Scraping MPC object names...")
+    df_objs = scrape_object_names(limit_mag=args.mag_limit)
+    if df_objs.empty:
+        print("[ERROR] Object list empty; please retry or provide your own list.")
+        return
+    print(f"[INFO] Objects: {len(df_objs)}")
+
+    print("[STEP] Building ephemerides (per site)...")
+    sites = [
+        ('La Palma', 28.76012, -17.87929, 2348),   # name, lat, lon, alt
+        ('Siding Spring', -31.2734, 149.06411, 1137),
+    ]
+    start_date = (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%d") if not args.start_utc else args.start_utc
+
+    combined_df = pd.DataFrame(columns=[
+        "datetime","RA","DEC","ALT","Sun_Alt","obj_name",
+        "Vmag","unc","d_total","ra_rate","dec_rate","site"
+    ])
+    for (site_name, lat, lon, h) in tqdm(sites, desc="Sites(ephem)", unit="site"):
+        temp = batch_fetch_ephemerides(
+            obj_list=df_objs['Obj_Name'],
+            start_date=start_date,
+            interval=args.interval,
+            step_count=args.steps,
+            site_lon=lon, site_lat=lat, site_height=h,
+            n_points=args.npoints
+        )
+        temp["site"] = site_name
+        combined_df = pd.concat([combined_df, temp], ignore_index=True)
+    print(f"[INFO] Ephemerides rows: {len(combined_df)}")
+
+    print("[STEP] Loading observations from image.single...")
+    recent_obs_df = load_observations_from_image_single(lookback_days=args.lookback_days,
+                                                        only_has_footprint=args.only_has_footprint)
+    print(f"[INFO] Observations rows: {len(recent_obs_df)}")
+
+    print("[STEP] Matching (merge_asof + footprint.contains, no per-minute dedupe)...")
+    matched_df = match_ephemeris_by_site(combined_df, recent_obs_df,
+                                         time_tolerance_sec=args.time_tol,
+                                         per_minute_cap=args.per_minute_cap)
+
+    # *** 新增：在输出前对 name + obs_time 去重 ***
+    print(f"[INFO] Before final deduplication: {len(matched_df)} rows")
+    if 'name' in matched_df.columns and 'obs_time' in matched_df.columns:
+        # 对同一个 name + obs_time 组合，只保留第一条记录
+        matched_df = matched_df.drop_duplicates(subset=['name', 'obs_time'], keep='first')
+        print(f"[INFO] After deduplication by (name, obs_time): {len(matched_df)} rows")
+    else:
+        print("[WARN] 'name' or 'obs_time' column not found, skipping final deduplication")
+
+    os.makedirs('data', exist_ok=True)
+    out_path = args.outfile or os.path.join('data', f'{datetime.today().strftime("%Y-%m-%d")}_merged.csv')
+    matched_df.to_csv(out_path, index=False)
+    print(matched_df.to_string(index=False))
+    print(f"\nWrote: {out_path} (rows={len(matched_df)})")
+
+# [disabled old entrypoint to avoid double-run]
+# ========================= In-memory enrichment (DataFrame → DataFrame) =========================
+
+def _enrich_df_from_ids(df_res, db=None, do_rollback=False):
+    """
+    Enrich a results DataFrame (must have 'id' column= image.single.id) with columns from image.single + raw.science.
+    Returns an enriched DataFrame; does NOT touch disk.
+    """
+    import pandas as _pd
+
+    if 'id' not in df_res.columns:
+        raise ValueError("df_res must contain an 'id' column (image.single.id).")
+
+    ids = (_pd.to_numeric(df_res['id'], errors='coerce')
+             .dropna().astype(int).tolist())
+
+    if len(ids) == 0:
+        return df_res.copy()
+
+    close_db = False
+    if db is None:
+        db = goto_silent()
+        close_db = True
+
+    try:
+        if do_rollback and hasattr(db, "rollback"):
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        sql = """
+        SELECT
+          s.id                              AS image_id,
+          s.photom_5sigma_detection_magnitude AS Photom_5sigma_limit,
+          s.detect_hfd_mean                 AS hfd,
+          s.photom_zeropoint                AS zero_point,
+          s.photom_zeropoint_uncert         AS zero_point_unc, 
+          r.id                              AS raw_id,
+          r.airmass, r.satcloud, r.seeing, r.dust,
+          r.exptime, r.filt
+        FROM "image"."single" AS s
+        JOIN "raw"."science" AS r
+          ON r.id = s.raw_id
+        WHERE s.id = ANY(%(ids)s)
+        ORDER BY s.id;
+        """
+        df_ctx = query_df(db, sql, {"ids": ids})
+
+    finally:
+        if close_db:
+            try:
+                if hasattr(db, "close"):
+                    db.close()
+            except Exception:
+                pass
+
+    df_final = (
+        df_res.merge(df_ctx, left_on="id", right_on="image_id", how="left")
+              .drop(columns=[c for c in ["image_id"] if c in df_res.columns or c in df_ctx.columns], errors="ignore")
+    )
+    return df_final
+
+
+# ========================= JPL Horizons per-row refine (site + time + target) =========================
+
+# --- Site params & aliases ---
+import astropy.units as _u
+from astropy.time import Time as _APTime
+
+_SITE_PARAMS = {
+    "La Palma":      dict(lat=28.76012,  lon=-17.87929, alt=2348),
+    "Siding Spring": dict(lat=-31.2734,  lon=149.06411, alt=1137),
+}
+_ALIASES = {
+    "Side Spring": "Siding Spring",
+    "SideSpring": "Siding Spring",
+    "SidingSpring": "Siding Spring",
+    "GOTO-N": "La Palma",
+    "GOTON": "La Palma",
+    "LP": "La Palma",
+    "GOTO-S": "Siding Spring",
+    "GOTOS": "Siding Spring",
+    "SSO": "Siding Spring",
+}
+
+def _to_minute_utc_str(ts):
+    import pandas as _pd
+    t = _pd.to_datetime(ts, utc=True, errors="coerce")
+    if _pd.isna(t): 
+        return None
+    return t.strftime("%Y-%m-%d %H:%M")
+
+def _norm_site(name: str):
+    s = str(name).strip()
+    s = _ALIASES.get(s, s)
+    if s not in _SITE_PARAMS:
+        raise ValueError(f"unknown site: {name!r} → 归一化后 {s!r} 不在 {_SITE_PARAMS.keys()}")
+    p = _SITE_PARAMS[s]
+    # astroquery.Horizons expects dict with 'lon', 'lat', 'elevation' Quantity
+    return s, {"lon": p["lon"] * _u.deg, "lat": p["lat"] * _u.deg, "elevation": (p["alt"]/1000.0) * _u.km}
+
+def _choose_target_name(row):
+    # Try common column names in priority order
+    for key in ["target", "object", "name", "designation", "desig", "mpc_name"]:
+        v = row.get(key) if hasattr(row, "get") else row[key] if key in row.index else None
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+def _fetch_one_horizons(site_name: str, time_minute_iso: str, target_name: str, max_retries: int = 2, sleep_s: float = 0.8):
+    from astroquery.jplhorizons import Horizons
+    import time as _time
+    from requests import HTTPError
+
+    site_key, loc = _norm_site(site_name)
+    t_jd = float(_APTime(time_minute_iso, format="iso", scale="utc").jd)
+    epochs_jd = [t_jd]
+
+    tries = []
+    if target_name:
+        tries.append((target_name, None))
+        tries.append((f"DES={target_name}", None))
+    # Fallbacks: if user传来的目标实在解析不了，可以再补其它 pattern
+    last_err = None
+    for id_val, id_type in tries:
+        for attempt in range(1, max_retries+1):
+            try:
+                obj = Horizons(id=id_val, id_type=id_type, location=loc, epochs=epochs_jd)
+                tab = obj.ephemerides()
+                df = tab.to_pandas()
+                return dict(
+                    RA=float(df.iloc[0]["RA"]),
+                    DEC=float(df.iloc[0]["DEC"]),
+                    RA_rate=float(df.iloc[0].get("RA_rate", float("nan"))),
+                    DEC_rate=float(df.iloc[0].get("DEC_rate", float("nan"))),
+                )
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries:
+                    _time.sleep(sleep_s)
+    if last_err:
+        raise last_err
+    raise RuntimeError("Horizons unknown failure")
+
+def refine_ephemerides_per_row(df, site_col="site", time_col="obs_time", target_col=None, print_limit=10):
+    """
+    For each row with site+time(+target), query JPL Horizons at minute precision. 
+    Writes RA_pre/DEC_pre/RA_rate_pre/DEC_rate_pre; uses cache for repeats.
+    """
+    import numpy as _np
+    from tqdm import tqdm
+
+    df_out = df.copy()
+    for c in ["RA_pre","DEC_pre","RA_rate_pre","DEC_rate_pre"]:
+        if c not in df_out.columns:
+            df_out[c] = _np.nan
+
+    cache = {}
+    ok, fail, printed = 0, 0, 0
+
+    it = tqdm(df_out.iterrows(), total=len(df_out), desc="JPL per-row", disable=False)
+    for idx, row in it:
+        site_val = row.get(site_col) if hasattr(row, "get") else row[site_col] if site_col in df_out.columns else None
+        t_min = _to_minute_utc_str(row.get(time_col) if hasattr(row, "get") else row[time_col] if time_col in df_out.columns else None)
+        if not site_val or not t_min:
+            if printed < print_limit:
+                print(f"[warn] skip: site={site_val!r}, time={row.get(time_col) if hasattr(row,'get') else None!r}")
+                printed += 1
+            fail += 1
+            continue
+
+        tgt = None
+        if target_col and target_col in df_out.columns:
+            tgt = str(row[target_col]).strip() if row[target_col] is not None else None
+        if not tgt:
+            tgt = _choose_target_name(row)
+
+        site_norm = _ALIASES.get(str(site_val).strip(), str(site_val).strip())
+        key = (site_norm, t_min, tgt or "")
+
+        if key not in cache:
+            try:
+                cache[key] = _fetch_one_horizons(site_norm, t_min, tgt)
+            except Exception as e:
+                cache[key] = None
+                if printed < print_limit:
+                    print(f"[fail] site={site_norm}, t={t_min}, target={tgt!r}, err={repr(e)}")
+                    printed += 1
+
+        res = cache[key]
+        if res is None:
+            fail += 1
+            continue
+
+        df_out.at[idx, "RA_pre"]       = res["RA"]
+        df_out.at[idx, "DEC_pre"]      = res["DEC"]
+        df_out.at[idx, "RA_rate_pre"]  = res["RA_rate"]
+        df_out.at[idx, "DEC_rate_pre"] = res["DEC_rate"]
+        ok += 1
+
+    print(f"[JPL] {ok} row succeed，{fail} row failed；unique request={len(cache)}")
+    return df_out
+
+
+# ==== Wrapper main to orchestrate: match → read TEMP → enrich (DF→DF) → JPL refine → write FINAL ====
+_old_main = main  # keep original
+
+def main():
+    import argparse, sys, tempfile, os, pandas as _pd
+
+    p = argparse.ArgumentParser(add_help=True)
+    # Original-known args to forward into old main
+    p.add_argument("--mag-limit", type=str, default="19.5")
+    p.add_argument("--interval", type=int, default=36)
+    p.add_argument("--steps", type=int, default=121)
+    p.add_argument("--npoints", type=int, default=96*60*60+1)
+    p.add_argument("--start-utc", type=str, default=None)
+    p.add_argument("--lookback-days", type=int, default=3)
+    p.add_argument("--only-has-footprint", action="store_true", default=True)
+    p.add_argument("--time-tol", type=int, default=60)
+    p.add_argument("--per-minute-cap", type=int, default=16)
+    p.add_argument("--outfile", type=str, default="")  # we will override with temp if empty
+
+    # New orchestration args
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    p.add_argument("--final-outfile", type=str, default=os.path.join('data',f'{today_str}_MPC.csv'),
+                   help="最终只写这一份结果(富化+JPL 精化后)。")
+    p.add_argument("--db-rollback", action="store_true", default=False,
+                   help="富化查询前是否先 rollback()。")
+    p.add_argument("--skip-jpl-refine", action="store_true", default=False,
+                   help="跳过 JPL per-row 精化。")
+    p.add_argument("--site-col", type=str, default="site")
+    p.add_argument("--time-col", type=str, default="obs_time")
+    p.add_argument("--target-col", type=str, default="target")
+
+    args, unknown = p.parse_known_args()
+
+    # ---- 1) Run original main into a temp CSV (then remove it) ----
+    tmp_dir = os.path.join("data", "_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_out = args.outfile or os.path.join(tmp_dir, "matched_tmp.csv")
+
+    # Build argv for original main (only pass recognized args)
+    argv_for_old = [sys.argv[0]]
+    for name in ["--mag-limit","--interval","--steps","--npoints","--start-utc","--lookback-days",
+                 "--only-has-footprint","--time-tol","--per-minute-cap","--outfile"]:
+        val = getattr(args, name.lstrip("-").replace("-","_"))
+        if isinstance(val, bool):
+            if val:
+                argv_for_old.append(name)
+        elif val is not None:
+            if name == "--outfile":
+                argv_for_old.extend([name, tmp_out])
+            else:
+                argv_for_old.extend([name, str(val)])
+
+    # Temporarily swap sys.argv so _old_main sees only its own flags
+    sys_argv_backup = sys.argv[:]
+    try:
+        sys.argv = argv_for_old
+        _old_main()
+    finally:
+        sys.argv = sys_argv_backup
+
+    # ---- 2) Load matched_tmp.csv (if created) ----
+    if not Path(tmp_out).exists():
+        raise FileNotFoundError(f"未找到匹配输出 {tmp_out}。请检查原匹配流程是否生成了CSV。")
+    matched_df = _pd.read_csv(tmp_out)
+
+    # Immediately remove the temp file to honor 'no local save' for the intermediate
+    try:
+        os.remove(tmp_out)
+    except Exception:
+        pass
+
+    # ---- 3) Enrich in-memory ----
+    df_enriched = _enrich_df_from_ids(matched_df, db=None, do_rollback=args.db_rollback)
+
+    # ---- 4) JPL per-row refine ----
+    if not args.skip_jpl_refine:
+        try:
+            df_final = refine_ephemerides_per_row(df_enriched, 
+                                                  site_col=args.site_col, 
+                                                  time_col=args.time_col, 
+                                                  target_col=args.target_col)
+        except Exception as e:
+            print("[WARN] JPL 精化失败，写入未精化版本：", repr(e))
+            df_final = df_enriched
+    else:
+        df_final = df_enriched
+
+    # *** 5) 在输出前对 name + obs_time 去重 ***
+    print(f"[INFO] Before final deduplication: {len(df_final)} rows")
+    if 'name' in df_final.columns and 'obs_time' in df_final.columns:
+        df_final = df_final.drop_duplicates(subset=['name', 'obs_time'], keep='first')
+        print(f"[INFO] After deduplication by (name, obs_time): {len(df_final)} rows")
+    else:
+        print("[WARN] 'name' or 'obs_time' column not found in final dataframe, skipping deduplication")
+
+    # ---- 6) Write ONLY the final CSV ----
+    os.makedirs(os.path.dirname(args.final_outfile) or ".", exist_ok=True)
+    df_final.to_csv(args.final_outfile, index=False)
+    print(f"[DONE] 最终输出：{args.final_outfile} (rows={len(df_final)})")
+
+
+if __name__ == "__main__":
+    main()
